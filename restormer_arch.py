@@ -394,3 +394,254 @@ class Restormer(nn.Module):
 
         return out_dec_level1
 
+
+
+
+##########################################################################
+## Wavelet FFN (WFFN v1) -- replaces GDFN in decoder levels 3/2/1 and refinement
+## Enabled only through WaveletRestormer; the original Restormer above is unchanged.
+
+def avg3(x):
+    # Fixed 3x3 mean filter; borders are normalised by the number of valid pixels
+    return F.avg_pool2d(x, 3, stride=1, padding=1, count_include_pad=False)
+
+def box_k(x, k):
+    # Separable k x k mean filter (H then W); borders normalised by valid pixels
+    x = F.avg_pool2d(x, (k, 1), stride=1, padding=(k // 2, 0), count_include_pad=False)
+    return F.avg_pool2d(x, (1, k), stride=1, padding=(0, k // 2), count_include_pad=False)
+
+
+def spectral_stats(x, K=8):
+    """Square-ring + orientation binned log-amplitude spectrum, returns B x C x 20 (fp32)."""
+    B, C, H, W = x.shape
+    win = torch.outer(torch.hann_window(H, device=x.device),
+                      torch.hann_window(W, device=x.device))
+    amp = torch.log1p(torch.fft.rfft2(x * win, norm='ortho').abs())       # B,C,H,W//2+1
+
+    fy = (torch.fft.fftfreq(H, device=x.device).abs() / 0.5)[:, None]     # normalised to [0,1]
+    fx = (torch.fft.rfftfreq(W, device=x.device) / 0.5)[None, :]
+    r, rmin = torch.maximum(fy, fx), torch.minimum(fy, fx)
+
+    ring = (r * K).long().clamp(max=K - 1)                                 # 0..7
+    band_in = torch.where(r < 0.25, 0.0, torch.where(r < 0.5, 0.25, 0.5))
+    orient = torch.where(rmin >= band_in, 2,                               # 2: corners
+                         torch.where(fx > fy, 0, 1))                       # 0: left/right, 1: up/down
+    bin_id = torch.where(ring < 2, ring, 2 + (ring - 2) * 3 + orient)      # 0..19
+
+    idx = bin_id.flatten()
+    s = torch.zeros(B, C, 20, device=x.device).index_add_(2, idx, amp.flatten(2))
+    cnt = torch.bincount(idx, minlength=20).clamp(min=1)
+    return s / cnt
+
+
+class PromptExtractor(nn.Module):
+    """Encoder skip feature -> global prompt p (B x 64)."""
+    def __init__(self, in_channels, squeeze=16, width=64):
+        super(PromptExtractor, self).__init__()
+        self.squeeze = nn.Conv1d(in_channels, squeeze, kernel_size=1, bias=True)
+        self.mlp = nn.Sequential(nn.Linear(20 * squeeze, width), nn.GELU(), nn.Linear(width, width))
+
+    def forward(self, x):
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            s = spectral_stats(x.float())
+            return self.mlp(self.squeeze(s).flatten(1))
+
+
+class WFFN(nn.Module):
+    """proj_in -> 2-level Haar -> per-band (remove, denoise, compensate) -> IDWT -> proj_out."""
+    def __init__(self, dim, ffn_expansion_factor, k_hf, k_lfmf, prompt_dim=64, eps=1e-6):
+        super(WFFN, self).__init__()
+        assert k_hf % 2 == 1 and k_lfmf % 2 == 1, 'box_k sizes must be odd'
+        h = int(dim * ffn_expansion_factor)
+        self.h, self.k_hf, self.k_lfmf, self.eps = h, k_hf, k_lfmf, eps
+        self.groups = -(-h // 8)
+
+        self.proj_in = nn.Conv2d(dim, h, kernel_size=1, bias=False)
+        self.proj_out = nn.Conv2d(h, dim, kernel_size=1, bias=False)
+
+        # LF: haze cue rho and compensation u_l (the latter is shared with MF)
+        self.lf_rho = nn.Conv2d(h, h, kernel_size=5, padding=2, groups=h, bias=True)
+        self.lf_ul = nn.Conv2d(h, h, kernel_size=5, padding=2, groups=h, bias=True)
+        # MF / HF: per-channel 1x7 rain response and log kappa; HF compensation from ll1_raw
+        self.mf_rain = nn.Conv2d(3 * h, 3 * h, kernel_size=(1, 7), padding=(0, 3), groups=3 * h, bias=True)
+        self.hf_rain = nn.Conv2d(3 * h, 3 * h, kernel_size=(1, 7), padding=(0, 3), groups=3 * h, bias=True)
+        self.mf_log_kappa = nn.Parameter(torch.full((1, 3 * h, 1, 1), 2.0))
+        self.hf_log_kappa = nn.Parameter(torch.full((1, 3 * h, 1, 1), 2.0))
+        self.hf_ul = nn.Conv2d(h, h, kernel_size=5, padding=2, groups=h, bias=True)
+
+        # Per-block head: p -> 9 knob groups x ceil(h/8)
+        self.head = nn.Sequential(nn.Linear(prompt_dim, 16), nn.GELU(), nn.Linear(16, 9 * self.groups))
+        nn.init.normal_(self.head[2].weight, std=0.01)
+        nn.init.constant_(self.head[2].bias, -2.0)
+
+        self.collect_stats = False
+        self.stats = {}
+
+    def knobs(self, p):
+        k = self.head(p).float().view(p.shape[0], 9, self.groups)
+        k = k.repeat_interleave(8, dim=2)[:, :, :self.h, None, None]           # B x 9 x h x 1 x 1
+        sp, sg = F.softplus, torch.sigmoid
+        return dict(lf_A=sp(k[:, 0]), lf_tau2=sp(k[:, 1]), lf_ug=k[:, 2],
+                    mf_lam=sg(k[:, 3]), mf_tau2=sp(k[:, 4]), mf_ug=k[:, 5],
+                    hf_lam=sg(k[:, 6]), hf_tau2=sp(k[:, 7]), hf_ug=k[:, 8])
+
+    def denoise(self, z, tau2, k):
+        # fp32: local mean/variance, scale-normalised variance, Wiener-like gate
+        mu = avg3(z)
+        e = (avg3(z * z) - mu * mu).clamp(min=0)
+        e_n = e / (box_k(e, k) + self.eps)
+        g = e_n / (e_n + tau2 + self.eps)
+        return mu + g * (z - mu), g
+
+    def remove_rain(self, x, conv, log_kappa, lam, k):
+        # fp32: energy of the 1x7 response relative to its k x k neighbourhood
+        a = conv(x.float())
+        s = avg3(a * a)
+        r = s / (box_k(s, k) + self.eps)
+        m = torch.sigmoid(torch.log(r + self.eps) - log_kappa.float())
+        return (1 - lam.repeat(1, 3, 1, 1) * m) * x.float(), m
+
+    def forward(self, x, p):
+        H, W = x.shape[-2:]
+        u = self.proj_in(x)
+        ph, pw = (-H) % 4, (-W) % 4
+        if ph or pw:
+            u = F.pad(u, (0, pw, 0, ph), mode='reflect')
+        LL1, *hf = haar_dwt(u)
+        LF, *mf = haar_dwt(LL1)
+        HF, MF = torch.cat(hf, dim=1), torch.cat(mf, dim=1)      # direction-major: [Dx; Dy; Dd]
+        ll1_raw, dtype = LL1, u.dtype
+        kn = self.knobs(p)
+
+        rho = torch.sigmoid(self.lf_rho(LF).float())
+        ul_lf = self.lf_ul(LF).float()
+        ul_hf = self.hf_ul(ll1_raw).float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            # LF: (1) dehaze, (2) denoise, (3) compensate
+            z_lf = LF.float() - kn['lf_A'] * rho
+            w_lf, g_lf = self.denoise(z_lf, kn['lf_tau2'], self.k_lfmf)
+            c_lf = 1 + F.softplus(kn['lf_ug'] + ul_lf)
+            LF2 = c_lf * w_lf
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            # MF: (1) remove rain, (2) denoise, (3) compensate with the LF u_l
+            z_mf, m_mf = self.remove_rain(MF, self.mf_rain, self.mf_log_kappa, kn['mf_lam'], self.k_lfmf)
+            w_mf, g_mf = self.denoise(z_mf, kn['mf_tau2'].repeat(1, 3, 1, 1), self.k_lfmf)
+            c_mf = 1 + F.softplus((kn['mf_ug'] + ul_lf).repeat(1, 3, 1, 1))
+            MF2 = c_mf * w_mf
+            # HF: same steps; u_l from ll1_raw
+            z_hf, m_hf = self.remove_rain(HF, self.hf_rain, self.hf_log_kappa, kn['hf_lam'], self.k_hf)
+            w_hf, g_hf = self.denoise(z_hf, kn['hf_tau2'].repeat(1, 3, 1, 1), self.k_hf)
+            c_hf = 1 + F.softplus((kn['hf_ug'] + ul_hf).repeat(1, 3, 1, 1))
+            HF2 = c_hf * w_hf
+
+        if self.collect_stats:
+            self.stats = dict(lf_rho=rho.detach(), lf_g=g_lf.detach(), lf_comp=c_lf.detach(),
+                              mf_m=m_mf.detach(), mf_g=g_mf.detach(), mf_comp=c_mf.detach(),
+                              hf_m=m_hf.detach(), hf_g=g_hf.detach(), hf_comp=c_hf.detach())
+
+        LL1n = haar_idwt(LF2.to(dtype), *MF2.to(dtype).chunk(3, dim=1))
+        v = haar_idwt(LL1n, *HF2.to(dtype).chunk(3, dim=1))[..., :H, :W]
+        return self.proj_out(v)
+
+
+class WaveletTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type, k_hf, k_lfmf):
+        super(WaveletTransformerBlock, self).__init__()
+
+        self.norm1 = LayerNorm(dim, LayerNorm_type)
+        self.attn = Attention(dim, num_heads, bias)
+        self.norm2 = LayerNorm(dim, LayerNorm_type)
+        self.wffn = WFFN(dim, ffn_expansion_factor, k_hf, k_lfmf)
+
+    def forward(self, x, p):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.wffn(self.norm2(x), p)
+        return x
+
+
+class PromptSequential(nn.ModuleList):
+    """Sequential container that passes the level prompt p to every block."""
+    def forward(self, x, p):
+        for block in self:
+            x = block(x, p)
+        return x
+
+
+##---------- Restormer with WFFN in decoder / refinement -----------------------
+class WaveletRestormer(Restormer):
+    def __init__(self,
+        inp_channels=3,
+        out_channels=3,
+        dim = 48,
+        num_blocks = [4,6,6,8],
+        num_refinement_blocks = 4,
+        heads = [1,2,4,8],
+        ffn_expansion_factor = 2.66,
+        bias = False,
+        LayerNorm_type = 'WithBias',
+        dual_pixel_task = False,
+        wffn_k_hf = [15, 31, 63, 63],      ## box_k for HF:    [decoder3, decoder2, decoder1, refinement]
+        wffn_k_lfmf = [7, 15, 31, 31],     ## box_k for LF/MF: [decoder3, decoder2, decoder1, refinement]
+    ):
+        super(WaveletRestormer, self).__init__(inp_channels, out_channels, dim, num_blocks, num_refinement_blocks,
+                                               heads, ffn_expansion_factor, bias, LayerNorm_type, dual_pixel_task)
+
+        def stage(width, n, head, i):
+            return PromptSequential([WaveletTransformerBlock(width, head, ffn_expansion_factor, bias, LayerNorm_type,
+                                                             wffn_k_hf[i], wffn_k_lfmf[i]) for _ in range(n)])
+
+        # Replace the GDFN decoder / refinement stages; encoder and latent keep GDFN
+        self.decoder_level3 = stage(int(dim*2**2), num_blocks[2], heads[2], 0)
+        self.decoder_level2 = stage(int(dim*2**1), num_blocks[1], heads[1], 1)
+        self.decoder_level1 = stage(int(dim*2**1), num_blocks[0], heads[0], 2)
+        self.refinement = stage(int(dim*2**1), num_refinement_blocks, heads[0], 3)
+
+        # One prompt extractor per decoder level, fed by the encoder skip of that level
+        self.prompt_level3 = PromptExtractor(int(dim*2**2))
+        self.prompt_level2 = PromptExtractor(int(dim*2**1))
+        self.prompt_level1 = PromptExtractor(dim)
+
+    def forward(self, inp_img):
+
+        inp_enc_level1 = self.patch_embed(inp_img)
+        out_enc_level1 = self.encoder_level1(inp_enc_level1)
+
+        inp_enc_level2 = self.down1_2(out_enc_level1)
+        out_enc_level2 = self.encoder_level2(inp_enc_level2)
+
+        inp_enc_level3 = self.down2_3(out_enc_level2)
+        out_enc_level3 = self.encoder_level3(inp_enc_level3)
+
+        p3 = self.prompt_level3(out_enc_level3)
+        p2 = self.prompt_level2(out_enc_level2)
+        p1 = self.prompt_level1(out_enc_level1)
+
+        inp_enc_level4 = self.down3_4(out_enc_level3)
+        latent = self.latent(inp_enc_level4)
+
+        inp_dec_level3 = self.up4_3(latent)
+        inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
+        inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
+        out_dec_level3 = self.decoder_level3(inp_dec_level3, p3)
+
+        inp_dec_level2 = self.up3_2(out_dec_level3)
+        inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
+        inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
+        out_dec_level2 = self.decoder_level2(inp_dec_level2, p2)
+
+        inp_dec_level1 = self.up2_1(out_dec_level2)
+        inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
+        out_dec_level1 = self.decoder_level1(inp_dec_level1, p1)
+
+        out_dec_level1 = self.refinement(out_dec_level1, p1)
+
+        #### For Dual-Pixel Defocus Deblurring Task ####
+        if self.dual_pixel_task:
+            out_dec_level1 = out_dec_level1 + self.skip_conv(inp_enc_level1)
+            out_dec_level1 = self.output(out_dec_level1)
+        ###########################
+        else:
+            out_dec_level1 = self.output(out_dec_level1) + inp_img
+
+
+        return out_dec_level1
